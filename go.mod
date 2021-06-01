@@ -1,32 +1,47 @@
-module github.com/tikv/client-go
+module github.com/tikv/client-go/v2
 
-go 1.15
+go 1.16
 
 require (
-	github.com/coreos/etcd v3.3.25+incompatible
+	github.com/cznic/mathutil v0.0.0-20181122101859-297441e03548
+	github.com/dgryski/go-farm v0.0.0-20190423205320-6a90982ecee2
+	github.com/dustin/go-humanize v1.0.0 // indirect
+	github.com/gogo/protobuf v1.3.2
+	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e // indirect
 	github.com/golang/protobuf v1.3.4
+	github.com/golang/snappy v0.0.2-0.20190904063534-ff6b7dc882cf // indirect
 	github.com/google/btree v1.0.0
+	github.com/google/go-cmp v0.5.2 // indirect
 	github.com/google/uuid v1.1.1
-	github.com/gorilla/mux v1.7.4
 	github.com/grpc-ecosystem/go-grpc-middleware v1.1.0
-	github.com/grpc-ecosystem/go-grpc-prometheus v1.2.0
-	github.com/json-iterator/go v1.1.10 // indirect
+	github.com/juju/testing v0.0.0-20210324180055-18c50b0c2098 // indirect
+	github.com/opentracing/opentracing-go v1.1.0
 	github.com/pingcap/check v0.0.0-20200212061837-5e12011dc712
+	github.com/pingcap/errors v0.11.5-0.20201126102027-b0a155152ca3
+	github.com/pingcap/failpoint v0.0.0-20210316064728-7acb0f0a3dfd
 	github.com/pingcap/goleveldb v0.0.0-20191226122134-f82aafb29989
-	github.com/pingcap/kvproto v0.0.0-20210219095907-b2375dcc80ad
-	github.com/pkg/errors v0.9.1
-	github.com/prometheus/client_golang v1.2.1
-	github.com/prometheus/common v0.9.1
-	github.com/sirupsen/logrus v1.4.2
-	github.com/spaolacci/murmur3 v1.1.0
-	github.com/tikv/pd v1.1.0-beta.0.20210122094357-c7aac753461a
-	go.etcd.io/etcd v3.3.25+incompatible // indirect
-	go.uber.org/multierr v1.6.0 // indirect
-	go.uber.org/zap v1.16.0 // indirect
-	golang.org/x/net v0.0.0-20201110031124-69a78807bb2b // indirect
-	golang.org/x/sys v0.0.0-20201113233024-12cec1faf1ba // indirect
-	golang.org/x/text v0.3.4 // indirect
-	golang.org/x/tools v0.0.0-20201116002733-ac45abd4c88c // indirect
-	google.golang.org/grpc v1.26.0
-	gopkg.in/yaml.v2 v2.3.0 // indirect
+	github.com/pingcap/kvproto v0.0.0-20210531063847-f42e582bf0bb
+	github.com/pingcap/log v0.0.0-20210317133921-96f4fcab92a4
+	github.com/pingcap/parser v0.0.0-20210525032559-c37778aff307
+	github.com/pingcap/tidb v2.0.11+incompatible
+	github.com/prometheus/client_golang v1.5.1
+	github.com/prometheus/client_model v0.2.0
+	github.com/remyoudompheng/bigfft v0.0.0-20200410134404-eec4a21b6bb0 // indirect
+	github.com/sirupsen/logrus v1.6.0 // indirect
+	github.com/tikv/pd v1.1.0-beta.0.20210323121136-78679e5e209d
+	github.com/twmb/murmur3 v1.1.3
+	go.etcd.io/etcd v0.5.0-alpha.5.0.20200824191128-ae9734ed278b
+	go.uber.org/atomic v1.7.0
+	go.uber.org/multierr v1.7.0 // indirect
+	go.uber.org/zap v1.16.0
+	golang.org/x/lint v0.0.0-20200130185559-910be7a94367 // indirect
+	golang.org/x/mod v0.4.2 // indirect
+	golang.org/x/net v0.0.0-20210316092652-d523dce5a7f4 // indirect
+	golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9
+	golang.org/x/sys v0.0.0-20210324051608-47abb6519492 // indirect
+	golang.org/x/text v0.3.6 // indirect
+	golang.org/x/time v0.0.0-20191024005414-555d28b269f0 // indirect
+	google.golang.org/genproto v0.0.0-20200224152610-e50cd9704f63 // indirect
+	google.golang.org/grpc v1.27.1
+	honnef.co/go/tools v0.2.0 // indirect
 )

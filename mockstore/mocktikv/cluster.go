@@ -17,12 +17,14 @@ import (
 	"bytes"
 	"context"
 	"math"
+	"sort"
 	"sync"
+	"time"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/tikv/client-go/codec"
+	pd "github.com/tikv/pd/client"
 )
 
 // Cluster simulates a TiKV cluster. It focuses on management and the change of
@@ -40,14 +42,27 @@ type Cluster struct {
 	id      uint64
 	stores  map[uint64]*Store
 	regions map[uint64]*Region
+
+	mvccStore MVCCStore
+
+	// delayEvents is used to control the execution sequence of rpc requests for test.
+	delayEvents map[delayKey]time.Duration
+	delayMu     sync.Mutex
+}
+
+type delayKey struct {
+	startTS  uint64
+	regionID uint64
 }
 
 // NewCluster creates an empty cluster. It needs to be bootstrapped before
 // providing service.
-func NewCluster() *Cluster {
+func NewCluster(mvccStore MVCCStore) *Cluster {
 	return &Cluster{
-		stores:  make(map[uint64]*Store),
-		regions: make(map[uint64]*Region),
+		stores:      make(map[uint64]*Store),
+		regions:     make(map[uint64]*Region),
+		delayEvents: make(map[delayKey]time.Duration),
+		mvccStore:   mvccStore,
 	}
 }
 
@@ -79,9 +94,6 @@ func (c *Cluster) allocID() uint64 {
 
 // GetAllRegions gets all the regions in the cluster.
 func (c *Cluster) GetAllRegions() []*Region {
-	c.Lock()
-	defer c.Unlock()
-
 	regions := make([]*Region, 0, len(c.regions))
 	for _, region := range c.regions {
 		regions = append(regions, region)
@@ -98,6 +110,18 @@ func (c *Cluster) GetStore(storeID uint64) *metapb.Store {
 		return proto.Clone(store.meta).(*metapb.Store)
 	}
 	return nil
+}
+
+// GetAllStores returns all Stores' meta.
+func (c *Cluster) GetAllStores() []*metapb.Store {
+	c.RLock()
+	defer c.RUnlock()
+
+	stores := make([]*metapb.Store, 0, len(c.stores))
+	for _, store := range c.stores {
+		stores = append(stores, proto.Clone(store.meta).(*metapb.Store))
+	}
+	return stores
 }
 
 // StopStore stops a store with storeID.
@@ -125,7 +149,7 @@ func (c *Cluster) CancelStore(storeID uint64) {
 	c.Lock()
 	defer c.Unlock()
 
-	//A store returns context.Cancelled Error when cancel is true.
+	// A store returns context.Cancelled Error when cancel is true.
 	if store := c.stores[storeID]; store != nil {
 		store.cancel = true
 	}
@@ -155,27 +179,28 @@ func (c *Cluster) GetStoreByAddr(addr string) *metapb.Store {
 }
 
 // GetAndCheckStoreByAddr checks and returns a Store's meta by an addr
-func (c *Cluster) GetAndCheckStoreByAddr(addr string) (*metapb.Store, error) {
+func (c *Cluster) GetAndCheckStoreByAddr(addr string) (ss []*metapb.Store, err error) {
 	c.RLock()
 	defer c.RUnlock()
 
 	for _, s := range c.stores {
 		if s.cancel {
-			return nil, context.Canceled
+			err = context.Canceled
+			return
 		}
 		if s.meta.GetAddress() == addr {
-			return proto.Clone(s.meta).(*metapb.Store), nil
+			ss = append(ss, proto.Clone(s.meta).(*metapb.Store))
 		}
 	}
-	return nil, nil
+	return
 }
 
-// AddStore adds a new Store to the cluster.
-func (c *Cluster) AddStore(storeID uint64, addr string) {
+// AddStore add a new Store to the cluster.
+func (c *Cluster) AddStore(storeID uint64, addr string, labels ...*metapb.StoreLabel) {
 	c.Lock()
 	defer c.Unlock()
 
-	c.stores[storeID] = newStore(storeID, addr)
+	c.stores[storeID] = newStore(storeID, addr, labels...)
 }
 
 // RemoveStore removes a Store from the cluster.
@@ -186,11 +211,20 @@ func (c *Cluster) RemoveStore(storeID uint64) {
 	delete(c.stores, storeID)
 }
 
-// UpdateStoreAddr updates store address for cluster.
-func (c *Cluster) UpdateStoreAddr(storeID uint64, addr string) {
+// MarkTombstone marks store as tombstone.
+func (c *Cluster) MarkTombstone(storeID uint64) {
 	c.Lock()
 	defer c.Unlock()
-	c.stores[storeID] = newStore(storeID, addr)
+	nm := *c.stores[storeID].meta
+	nm.State = metapb.StoreState_Tombstone
+	c.stores[storeID].meta = &nm
+}
+
+// UpdateStoreAddr updates store address for cluster.
+func (c *Cluster) UpdateStoreAddr(storeID uint64, addr string, labels ...*metapb.StoreLabel) {
+	c.Lock()
+	defer c.Unlock()
+	c.stores[storeID] = newStore(storeID, addr, labels...)
 }
 
 // GetRegion returns a Region's meta and leader ID.
@@ -198,8 +232,8 @@ func (c *Cluster) GetRegion(regionID uint64) (*metapb.Region, uint64) {
 	c.RLock()
 	defer c.RUnlock()
 
-	r, ok := c.regions[regionID]
-	if !ok {
+	r := c.regions[regionID]
+	if r == nil {
 		return nil, 0
 	}
 	return proto.Clone(r.Meta).(*metapb.Region), r.leader
@@ -210,6 +244,11 @@ func (c *Cluster) GetRegionByKey(key []byte) (*metapb.Region, *metapb.Peer) {
 	c.RLock()
 	defer c.RUnlock()
 
+	return c.getRegionByKeyNoLock(key)
+}
+
+// getRegionByKeyNoLock returns the Region and its leader whose range contains the key without Lock.
+func (c *Cluster) getRegionByKeyNoLock(key []byte) (*metapb.Region, *metapb.Peer) {
 	for _, r := range c.regions {
 		if regionContains(r.Meta.StartKey, r.Meta.EndKey, key) {
 			return proto.Clone(r.Meta).(*metapb.Region), proto.Clone(r.leaderPeer()).(*metapb.Peer)
@@ -223,7 +262,7 @@ func (c *Cluster) GetPrevRegionByKey(key []byte) (*metapb.Region, *metapb.Peer) 
 	c.RLock()
 	defer c.RUnlock()
 
-	currentRegion, _ := c.GetRegionByKey(key)
+	currentRegion, _ := c.getRegionByKeyNoLock(key)
 	if len(currentRegion.StartKey) == 0 {
 		return nil, nil
 	}
@@ -248,12 +287,67 @@ func (c *Cluster) GetRegionByID(regionID uint64) (*metapb.Region, *metapb.Peer) 
 	return nil, nil
 }
 
+// ScanRegions returns at most `limit` regions from given `key` and their leaders.
+func (c *Cluster) ScanRegions(startKey, endKey []byte, limit int) []*pd.Region {
+	c.RLock()
+	defer c.RUnlock()
+
+	regions := make([]*Region, 0, len(c.regions))
+	for _, region := range c.regions {
+		regions = append(regions, region)
+	}
+
+	sort.Slice(regions, func(i, j int) bool {
+		return bytes.Compare(regions[i].Meta.GetStartKey(), regions[j].Meta.GetStartKey()) < 0
+	})
+
+	startPos := sort.Search(len(regions), func(i int) bool {
+		if len(regions[i].Meta.GetEndKey()) == 0 {
+			return true
+		}
+		return bytes.Compare(regions[i].Meta.GetEndKey(), startKey) > 0
+	})
+	regions = regions[startPos:]
+	if len(endKey) > 0 {
+		endPos := sort.Search(len(regions), func(i int) bool {
+			return bytes.Compare(regions[i].Meta.GetStartKey(), endKey) >= 0
+		})
+		if endPos > 0 {
+			regions = regions[:endPos]
+		}
+	}
+	if limit > 0 && len(regions) > limit {
+		regions = regions[:limit]
+	}
+
+	result := make([]*pd.Region, 0, len(regions))
+	for _, region := range regions {
+		leader := region.leaderPeer()
+		if leader == nil {
+			leader = &metapb.Peer{}
+		} else {
+			leader = proto.Clone(leader).(*metapb.Peer)
+		}
+
+		r := &pd.Region{
+			Meta:   proto.Clone(region.Meta).(*metapb.Region),
+			Leader: leader,
+		}
+		result = append(result, r)
+	}
+
+	return result
+}
+
 // Bootstrap creates the first Region. The Stores should be in the Cluster before
 // bootstrap.
 func (c *Cluster) Bootstrap(regionID uint64, storeIDs, peerIDs []uint64, leaderPeerID uint64) {
 	c.Lock()
 	defer c.Unlock()
 
+	if len(storeIDs) != len(peerIDs) {
+		panic("len(storeIDs) != len(peerIDs)")
+	}
 	c.regions[regionID] = newRegion(regionID, storeIDs, peerIDs, leaderPeerID)
 }
 
@@ -295,12 +389,15 @@ func (c *Cluster) Split(regionID, newRegionID uint64, key []byte, peerIDs []uint
 }
 
 // SplitRaw splits a Region at the key (not encoded) and creates new Region.
-func (c *Cluster) SplitRaw(regionID, newRegionID uint64, rawKey []byte, peerIDs []uint64, leaderPeerID uint64) {
+func (c *Cluster) SplitRaw(regionID, newRegionID uint64, rawKey []byte, peerIDs []uint64, leaderPeerID uint64) *metapb.Region {
 	c.Lock()
 	defer c.Unlock()
 
 	newRegion := c.regions[regionID].split(newRegionID, rawKey, peerIDs, leaderPeerID)
 	c.regions[newRegionID] = newRegion
+	// The mocktikv should return a deep copy of meta info to avoid data race
+	meta := proto.Clone(newRegion.Meta)
+	return meta.(*metapb.Region)
 }
 
 // Merge merges 2 regions, their key ranges should be adjacent.
@@ -312,20 +409,37 @@ func (c *Cluster) Merge(regionID1, regionID2 uint64) {
 	delete(c.regions, regionID2)
 }
 
-// SplitTable evenly splits the data in table into count regions.
+// SplitKeys evenly splits the start, end key into "count" regions.
 // Only works for single store.
-func (c *Cluster) SplitTable(mvccStore MVCCStore, tableID int64, count int) {
-	tableStart := codec.GenTableRecordPrefix(tableID)
-	tableEnd := tableStart.PrefixNext()
-	c.splitRange(mvccStore, NewMvccKey(tableStart), NewMvccKey(tableEnd), count)
+func (c *Cluster) SplitKeys(start, end []byte, count int) {
+	c.splitRange(c.mvccStore, NewMvccKey(start), NewMvccKey(end), count)
 }
 
-// SplitIndex evenly splits the data in index into count regions.
-// Only works for single store.
-func (c *Cluster) SplitIndex(mvccStore MVCCStore, tableID, indexID int64, count int) {
-	indexStart := codec.EncodeTableIndexPrefix(tableID, indexID)
-	indexEnd := indexStart.PrefixNext()
-	c.splitRange(mvccStore, NewMvccKey(indexStart), NewMvccKey(indexEnd), count)
+// ScheduleDelay schedules a delay event for a transaction on a region.
+func (c *Cluster) ScheduleDelay(startTS, regionID uint64, dur time.Duration) {
+	c.delayMu.Lock()
+	c.delayEvents[delayKey{startTS: startTS, regionID: regionID}] = dur
+	c.delayMu.Unlock()
+}
+
+// UpdateStoreLabels merge the target and owned labels together
+func (c *Cluster) UpdateStoreLabels(storeID uint64, labels []*metapb.StoreLabel) {
+	c.Lock()
+	defer c.Unlock()
+	c.stores[storeID].mergeLabels(labels)
+}
+
+func (c *Cluster) handleDelay(startTS, regionID uint64) {
+	key := delayKey{startTS: startTS, regionID: regionID}
+	c.delayMu.Lock()
+	dur, ok := c.delayEvents[key]
+	if ok {
+		delete(c.delayEvents, key)
+	}
+	c.delayMu.Unlock()
+	if ok {
+		time.Sleep(dur)
+	}
 }
 
 func (c *Cluster) splitRange(mvccStore MVCCStore, start, end MvccKey, count int) {
@@ -336,11 +450,11 @@ func (c *Cluster) splitRange(mvccStore MVCCStore, start, end MvccKey, count int)
 	c.createNewRegions(regionPairs, start, end)
 }
 
-// getPairsGroupByRegions groups the key value pairs into splitted regions.
+// getEntriesGroupByRegions groups the key value pairs into splitted regions.
 func (c *Cluster) getEntriesGroupByRegions(mvccStore MVCCStore, start, end MvccKey, count int) [][]Pair {
 	startTS := uint64(math.MaxUint64)
-	limit := int(math.MaxInt32)
-	pairs := mvccStore.Scan(start.Raw(), end.Raw(), limit, startTS, kvrpcpb.IsolationLevel_SI)
+	limit := math.MaxInt32
+	pairs := mvccStore.Scan(start.Raw(), end.Raw(), limit, startTS, kvrpcpb.IsolationLevel_SI, nil)
 	regionEntriesSlice := make([][]Pair, 0, count)
 	quotient := len(pairs) / count
 	remainder := len(pairs) % count
@@ -417,7 +531,7 @@ func (c *Cluster) firstStoreID() uint64 {
 
 // getRegionsCoverRange gets regions in the cluster that has intersection with [start, end).
 func (c *Cluster) getRegionsCoverRange(start, end MvccKey) []*Region {
-	var regions []*Region
+	regions := make([]*Region, 0, len(c.regions))
 	for _, region := range c.regions {
 		onRight := bytes.Compare(end, region.Meta.StartKey) <= 0
 		onLeft := bytes.Compare(region.Meta.EndKey, start) <= 0
@@ -447,7 +561,7 @@ func newPeerMeta(peerID, storeID uint64) *metapb.Peer {
 
 func newRegion(regionID uint64, storeIDs, peerIDs []uint64, leaderPeerID uint64) *Region {
 	if len(storeIDs) != len(peerIDs) {
-		panic("length of storeIDs and peerIDs mismatch")
+		panic("len(storeIDs) != len(peerIds)")
 	}
 	peers := make([]*metapb.Peer, 0, len(storeIDs))
 	for i := range storeIDs {
@@ -496,7 +610,7 @@ func (r *Region) leaderPeer() *metapb.Peer {
 
 func (r *Region) split(newRegionID uint64, key MvccKey, peerIDs []uint64, leaderPeerID uint64) *Region {
 	if len(r.Meta.Peers) != len(peerIDs) {
-		panic("length of storeIDs and peerIDs mismatch")
+		panic("len(r.meta.Peers) != len(peerIDs)")
 	}
 	storeIDs := make([]uint64, 0, len(r.Meta.Peers))
 	for _, peer := range r.Meta.Peers {
@@ -539,11 +653,34 @@ type Store struct {
 	cancel bool // return context.Cancelled error when cancel is true.
 }
 
-func newStore(storeID uint64, addr string) *Store {
+func newStore(storeID uint64, addr string, labels ...*metapb.StoreLabel) *Store {
 	return &Store{
 		meta: &metapb.Store{
 			Id:      storeID,
 			Address: addr,
+			Labels:  labels,
 		},
 	}
+}
+
+func (s *Store) mergeLabels(labels []*metapb.StoreLabel) {
+	if len(s.meta.Labels) < 1 {
+		s.meta.Labels = labels
+		return
+	}
+	kv := make(map[string]string, len(s.meta.Labels))
+	for _, label := range s.meta.Labels {
+		kv[label.Key] = label.Value
+	}
+	for _, label := range labels {
+		kv[label.Key] = label.Value
+	}
+	mergedLabels := make([]*metapb.StoreLabel, 0, len(kv))
+	for k, v := range kv {
+		mergedLabels = append(mergedLabels, &metapb.StoreLabel{
+			Key:   k,
+			Value: v,
+		})
+	}
+	s.meta.Labels = mergedLabels
 }
