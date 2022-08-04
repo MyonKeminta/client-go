@@ -118,6 +118,12 @@ func (action actionPessimisticLock) handleSingleBatch(c *twoPhaseCommitter, bo *
 	}
 	lockWaitStartTime := action.WaitStartTime
 	var resolvingRecordToken *int
+
+	keysStr := make([]string, 0, len(mutations))
+	for _, k := range mutations {
+		keysStr = append(keysStr, hex.EncodeToString(k.Key))
+	}
+
 	for {
 		// if lockWaitTime set, refine the request `WaitTimeout` field based on timeout limit
 		if action.LockWaitTime() > 0 && action.LockWaitTime() != kv.LockAlwaysWait {
@@ -146,8 +152,12 @@ func (action actionPessimisticLock) handleSingleBatch(c *twoPhaseCommitter, bo *
 		}
 		sender := locate.NewRegionRequestSender(c.store.GetRegionCache(), c.store.GetTiKVClient())
 		startTime := time.Now()
+		logutil.BgLogger().Info("sending pessimistic lock req", zap.Strings("keys", keysStr), zap.Stringer("req", req.PessimisticLock()))
 		resp, err := sender.SendReq(bo, req, batch.region, client.ReadTimeoutShort)
+		respInner, _ := resp.Resp.(*kvrpcpb.PessimisticLockResponse)
 		reqDuration := time.Since(startTime)
+		logutil.BgLogger().Info("received pessimistic lock resp", zap.Strings("keys", keysStr), zap.Stringer("req", req.PessimisticLock()),
+			zap.Stringer("resp", respInner), zap.Duration("timeCost", reqDuration), zap.Error(err))
 		if action.LockCtx.Stats != nil {
 			atomic.AddInt64(&action.LockCtx.Stats.LockRPCTime, int64(reqDuration))
 			atomic.AddInt64(&action.LockCtx.Stats.LockRPCCount, 1)
