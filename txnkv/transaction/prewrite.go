@@ -271,8 +271,11 @@ func (action actionPrewrite) handleSingleBatch(c *twoPhaseCommitter, bo *retry.B
 		resp, err := sender.SendReq(bo, req, batch.region, client.ReadTimeoutShort)
 		// Unexpected error occurs, return it
 		if err != nil {
+			logutil.BgLogger().Info("prewrite req failed", zap.Stringer("req", req.Prewrite()), zap.Error(err))
 			return err
 		}
+
+		logutil.BgLogger().Info("prewrite RPC", zap.Stringer("req", req.Prewrite()), zap.Stringer("resp", resp.Resp.(*kvrpcpb.PrewriteResponse)))
 
 		regionErr, err := resp.GetRegionError()
 		if err != nil {

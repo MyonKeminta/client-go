@@ -421,6 +421,8 @@ func (lr *LockResolver) ResolveLocksDone(callerStartTS uint64, token int) {
 
 func (lr *LockResolver) resolveLocks(bo *retry.Backoffer, opts ResolveLocksOptions) (ResolveLockResult, error) {
 	callerStartTS, locks, forRead, lite, detail := opts.CallerStartTS, opts.Locks, opts.ForRead, opts.Lite, opts.Detail
+	logutil.BgLogger().Info("resolve lock invoked", zap.Uint64("caller", callerStartTS), zap.Stringers("locks", locks), zap.Bool("forRead", forRead),
+		zap.Stack("stack"))
 	if lr.testingKnobs.meetLock != nil {
 		lr.testingKnobs.meetLock(locks)
 	}
@@ -446,6 +448,9 @@ func (lr *LockResolver) resolveLocks(bo *retry.Backoffer, opts ResolveLocksOptio
 	var resolve func(*Lock, bool) (TxnStatus, error)
 	resolve = func(l *Lock, forceSyncCommit bool) (TxnStatus, error) {
 		status, err := lr.getTxnStatusFromLock(bo, l, callerStartTS, forceSyncCommit, detail)
+		logutil.BgLogger().Info("getTxnStatusFromLock gets result", zap.Uint64("caller", callerStartTS), zap.Stringer("lock", l), zap.Bool("forceSyncCommit", forceSyncCommit),
+			zap.Uint64("resultTtl", status.ttl), zap.Uint64("resultCommitTs", status.commitTS),
+			zap.Stringer("resultAction", status.action), zap.Stringer("resultPrimary", status.primaryLock), zap.Error(err))
 		if err != nil {
 			return TxnStatus{}, err
 		}
@@ -737,6 +742,7 @@ func (lr *LockResolver) getTxnStatus(bo *retry.Backoffer, txnID uint64, primary 
 			return status, errors.WithStack(tikverr.ErrBodyMissing)
 		}
 		cmdResp := resp.Resp.(*kvrpcpb.CheckTxnStatusResponse)
+		logutil.BgLogger().Info("CheckTxnStatus RPC", zap.Stringer("req", req.CheckTxnStatus()), zap.Stringer("resp", cmdResp))
 		if keyErr := cmdResp.GetError(); keyErr != nil {
 			txnNotFound := keyErr.GetTxnNotFound()
 			if txnNotFound != nil {
@@ -893,6 +899,7 @@ func (lr *LockResolver) checkSecondaries(bo *retry.Backoffer, txnID uint64, curK
 	}
 
 	checkResp := resp.Resp.(*kvrpcpb.CheckSecondaryLocksResponse)
+	logutil.BgLogger().Info("CheckSecondariesLocks RPC", zap.Stringer("req", req.CheckSecondaryLocks()), zap.Stringer("resp", checkResp))
 	return shared.addKeys(checkResp.Locks, len(curKeys), txnID, checkResp.CommitTs)
 }
 
