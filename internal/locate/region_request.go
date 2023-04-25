@@ -1205,6 +1205,8 @@ func (s *RegionRequestSender) SendReqCtx(
 			}
 		}
 
+		logutil.Logger(bo.GetCtx()).Info("sending request", zap.Stringer("reqType", req.Type), zap.Stringer("req", req.Req.(fmt.Stringer)), zap.Stack("stack"))
+
 		var retry bool
 		resp, retry, err = s.sendReqToRegion(bo, rpcCtx, req, timeout)
 		if err != nil {
