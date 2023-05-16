@@ -1382,6 +1382,7 @@ func (s *RegionRequestSender) sendReqToRegion(
 	if v := bo.GetCtx().Value(util.SessionID); v != nil {
 		sessionID = v.(uint64)
 	}
+	logutil.Logger(ctx).Info("sending request", zap.Stringer("reqType", req.Type), zap.Uint64("sessionID", sessionID))
 
 	injectFailOnSend := false
 	if val, e := util.EvalFailpoint("rpcFailOnSend"); e == nil {
