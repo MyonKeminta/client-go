@@ -1006,6 +1006,8 @@ func (s *RegionRequestSender) SendReqCtx(
 			return nil, nil, err
 		}
 
+		logutil.BgLogger().Info("sent request to tikv", zap.Stringer("reqType", req.Type), zap.Stringer("req", req.Req.(fmt.Stringer)), zap.Stringer("resp", resp.Resp.(fmt.Stringer)))
+
 		// recheck whether the session/query is killed during the Next()
 		boVars := bo.GetVars()
 		if boVars != nil && boVars.Killed != nil && atomic.LoadUint32(boVars.Killed) == 1 {
