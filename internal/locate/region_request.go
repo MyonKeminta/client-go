@@ -693,6 +693,15 @@ func (state *accessFollower) isCandidate(idx AccessIndex, replica *replica) bool
 	if replica.isEpochStale() || replica.isExhausted(1) || replica.store.getLivenessState() == unreachable || replica.deadlineErrUsingConfTimeout {
 		return false
 	}
+	slowTimestamp := atomic.LoadInt64(&replica.store.slowTimestamp)
+	if slowTimestamp != 0 {
+		if time.Since(time.UnixMilli(slowTimestamp)) < time.Minute*5 {
+			return false
+		}
+		if !atomic.CompareAndSwapInt64(&replica.store.slowTimestamp, slowTimestamp, 0) {
+			return false
+		}
+	}
 	if state.option.leaderOnly && idx == state.leaderIdx {
 		// The request can only be sent to the leader.
 		return true
@@ -1206,8 +1215,34 @@ func (s *RegionRequestSender) SendReqCtx(
 		}
 
 		var retry bool
+		startTime := time.Now()
 		resp, retry, err = s.sendReqToRegion(bo, rpcCtx, req, timeout)
+		duration := time.Since(startTime)
 		req.IsRetryRequest = true
+		if duration > time.Second*15 && rpcCtx.Store.getLivenessState() == reachable {
+			isSlow := false
+			switch req.Type {
+			case tikvrpc.CmdGet, tikvrpc.CmdBatchGet, tikvrpc.CmdPrewrite, tikvrpc.CmdCommit, tikvrpc.CmdPessimisticLock, tikvrpc.CmdResolveLock:
+				isSlow = true
+			case tikvrpc.CmdCop:
+				if err != nil || resp.Resp.(*coprocessor.Response).ExecDetailsV2.ScanDetailV2.RocksdbKeySkippedCount < 100000 {
+					isSlow = true
+				}
+			}
+			if isSlow {
+				now := time.Now().UnixMilli()
+				for {
+					currentSlowTimestamp := atomic.LoadInt64(&rpcCtx.Store.slowTimestamp)
+					if currentSlowTimestamp >= now {
+						break
+					}
+					if atomic.CompareAndSwapInt64(&rpcCtx.Store.slowTimestamp, currentSlowTimestamp, now) {
+						break
+					}
+				}
+			}
+		}
+
 		if err != nil {
 			msg := fmt.Sprintf("send request failed, err: %v", err.Error())
 			s.logSendReqError(bo, msg, regionID, tryTimes, req, totalErrors)
