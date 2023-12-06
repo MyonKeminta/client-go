@@ -1219,8 +1219,9 @@ func (s *RegionRequestSender) SendReqCtx(
 		resp, retry, err = s.sendReqToRegion(bo, rpcCtx, req, timeout)
 		duration := time.Since(startTime)
 		req.IsRetryRequest = true
-		if duration > time.Second*15 && rpcCtx.Store.getLivenessState() == reachable {
-			isSlow := false
+
+		isSlow := false
+		if duration > time.Second*15 && rpcCtx.Store.getLivenessState() != unreachable || err != nil {
 			switch req.Type {
 			case tikvrpc.CmdGet, tikvrpc.CmdBatchGet, tikvrpc.CmdPrewrite, tikvrpc.CmdCommit, tikvrpc.CmdPessimisticLock, tikvrpc.CmdResolveLock:
 				isSlow = true
@@ -1229,16 +1230,20 @@ func (s *RegionRequestSender) SendReqCtx(
 					isSlow = true
 				}
 			}
-			if isSlow {
-				now := time.Now().UnixMilli()
-				for {
-					currentSlowTimestamp := atomic.LoadInt64(&rpcCtx.Store.slowTimestamp)
-					if currentSlowTimestamp >= now {
-						break
-					}
-					if atomic.CompareAndSwapInt64(&rpcCtx.Store.slowTimestamp, currentSlowTimestamp, now) {
-						break
-					}
+		} else if err != nil {
+			if duration >= timeout || (req.Context.MaxExecutionDurationMs > 0 && duration > time.Millisecond*time.Duration(req.Context.MaxExecutionDurationMs)) {
+				isSlow = true
+			}
+		}
+		if isSlow {
+			now := time.Now().UnixMilli()
+			for {
+				currentSlowTimestamp := atomic.LoadInt64(&rpcCtx.Store.slowTimestamp)
+				if currentSlowTimestamp >= now {
+					break
+				}
+				if atomic.CompareAndSwapInt64(&rpcCtx.Store.slowTimestamp, currentSlowTimestamp, now) {
+					break
 				}
 			}
 		}
