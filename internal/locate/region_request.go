@@ -242,6 +242,7 @@ type replica struct {
 	attempts int
 	// deadlineErrUsingConfTimeout indicates the replica is already tried, but the received deadline exceeded error.
 	deadlineErrUsingConfTimeout bool
+	deadlineErrWithStack        error
 }
 
 func (r *replica) isEpochStale() bool {
@@ -577,6 +578,18 @@ type accessFollower struct {
 // if the leader read receive server-is-busy and connection errors, the region cache is still valid,
 // and the state will be changed to tryFollower, which will read by replica read.
 func (state *accessFollower) next(bo *retry.Backoffer, selector *replicaSelector) (*RPCContext, error) {
+	var sessionID uint64
+	if v := bo.GetCtx().Value(util.SessionID); v != nil {
+		sessionID = v.(uint64)
+	}
+
+	replicasStr := make([]string, 0, 3)
+	for _, replica := range selector.replicas {
+		replicasStr = append(replicasStr, fmt.Sprintf("{ store: %v, attempts: %v, deadlineErrUsingConfTimeout: %v, deadlineErrWithStack: %+q }", replica.store.storeID, replica.attempts, replica.deadlineErrUsingConfTimeout, replica.deadlineErrWithStack))
+	}
+
+	logutil.Logger(bo.GetCtx()).Info("accessFollower.next called", zap.Uint64("connID", sessionID), zap.Uint64("region", selector.region.GetID()), zap.Strings("replicas", replicasStr), zap.String("state", fmt.Sprintf("%+v", *state)))
+
 	resetStaleRead := false
 	if state.lastIdx < 0 {
 		if state.tryLeader {
@@ -633,7 +646,8 @@ func (state *accessFollower) next(bo *retry.Backoffer, selector *replicaSelector
 				zap.Bool("leader-unreachable", leaderUnreachable),
 				zap.Bool("leader-invalid", leaderInvalid),
 				zap.Bool("stale-read", state.isStaleRead),
-				zap.Any("labels", state.option.labels))
+				zap.Any("labels", state.option.labels),
+				zap.Uint64("connID", sessionID))
 		}
 		if leaderInvalid || leader.deadlineErrUsingConfTimeout {
 			// In stale-read, the request will fallback to leader after the local follower failure.
@@ -692,15 +706,6 @@ func (state *accessFollower) isCandidate(idx AccessIndex, replica *replica) bool
 	// the epoch is staled or retry exhausted, or the store is unreachable.
 	if replica.isEpochStale() || replica.isExhausted(1) || replica.store.getLivenessState() == unreachable || replica.deadlineErrUsingConfTimeout {
 		return false
-	}
-	slowTimestamp := atomic.LoadInt64(&replica.store.slowTimestamp)
-	if slowTimestamp != 0 {
-		if time.Since(time.UnixMilli(slowTimestamp)) < time.Minute*5 {
-			return false
-		}
-		if !atomic.CompareAndSwapInt64(&replica.store.slowTimestamp, slowTimestamp, 0) {
-			return false
-		}
 	}
 	if state.option.leaderOnly && idx == state.leaderIdx {
 		// The request can only be sent to the leader.
@@ -916,6 +921,7 @@ func (s *replicaSelector) onReadReqConfigurableTimeout(req *tikvrpc.Request) boo
 		tikvrpc.CmdCop, tikvrpc.CmdBatchCop, tikvrpc.CmdCopStream:
 		if target := s.targetReplica(); target != nil {
 			target.deadlineErrUsingConfTimeout = true
+			target.deadlineErrWithStack = errors.New("deadlineErrUsingConfTimeout")
 		}
 		if accessLeader, ok := s.state.(*accessKnownLeader); ok {
 			// If leader return deadline exceeded error, we should try to access follower next time.
@@ -1215,39 +1221,8 @@ func (s *RegionRequestSender) SendReqCtx(
 		}
 
 		var retry bool
-		startTime := time.Now()
 		resp, retry, err = s.sendReqToRegion(bo, rpcCtx, req, timeout)
-		duration := time.Since(startTime)
 		req.IsRetryRequest = true
-
-		isSlow := false
-		if duration > time.Second*15 && rpcCtx.Store.getLivenessState() != unreachable || err != nil {
-			switch req.Type {
-			case tikvrpc.CmdGet, tikvrpc.CmdBatchGet, tikvrpc.CmdPrewrite, tikvrpc.CmdCommit, tikvrpc.CmdPessimisticLock, tikvrpc.CmdResolveLock:
-				isSlow = true
-			case tikvrpc.CmdCop:
-				if err != nil || resp.Resp.(*coprocessor.Response).ExecDetailsV2.ScanDetailV2.RocksdbKeySkippedCount < 100000 {
-					isSlow = true
-				}
-			}
-		} else if err != nil {
-			if duration >= timeout || (req.Context.MaxExecutionDurationMs > 0 && duration > time.Millisecond*time.Duration(req.Context.MaxExecutionDurationMs)) {
-				isSlow = true
-			}
-		}
-		if isSlow {
-			now := time.Now().UnixMilli()
-			for {
-				currentSlowTimestamp := atomic.LoadInt64(&rpcCtx.Store.slowTimestamp)
-				if currentSlowTimestamp >= now {
-					break
-				}
-				if atomic.CompareAndSwapInt64(&rpcCtx.Store.slowTimestamp, currentSlowTimestamp, now) {
-					break
-				}
-			}
-		}
-
 		if err != nil {
 			msg := fmt.Sprintf("send request failed, err: %v", err.Error())
 			s.logSendReqError(bo, msg, regionID, tryTimes, req, totalErrors)

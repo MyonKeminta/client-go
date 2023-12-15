@@ -2310,8 +2310,6 @@ type Store struct {
 	// this mechanism is currently only applicable for TiKV stores.
 	livenessState    uint32
 	unreachableSince time.Time
-
-	slowTimestamp int64
 }
 
 type resolveState uint64
