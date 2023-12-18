@@ -1467,6 +1467,11 @@ func (s *RegionRequestSender) sendReqToRegion(bo *retry.Backoffer, rpcCtx *RPCCo
 	if !injectFailOnSend {
 		start := time.Now()
 		resp, err = s.client.SendRequest(ctx, sendToAddr, req, timeout)
+		var respStringer fmt.Stringer
+		if resp != nil && resp.Resp != nil {
+			respStringer = resp.Resp.(fmt.Stringer)
+		}
+		logutil.Logger(ctx).Info("SendRequest finished", zap.Uint64("connID", sessionID), zap.Stringer("type", req.Type), zap.Stringer("req", req.Req.(fmt.Stringer)), zap.Stringer("resp", respStringer), zap.Duration("duration", time.Since(start)), zap.Duration("timeout", timeout), zap.Error(err))
 		if s.Stats != nil {
 			RecordRegionRequestRuntimeStats(s.Stats, req.Type, time.Since(start))
 			if val, fpErr := util.EvalFailpoint("tikvStoreRespResult"); fpErr == nil {
