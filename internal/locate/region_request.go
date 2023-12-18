@@ -1008,7 +1008,18 @@ func (s *replicaSelector) updateLeader(leader *metapb.Peer) {
 
 // For some reasons, the leader is unreachable by now, try followers instead.
 // the state is changed in accessFollower.next when leader is unavailable.
-func (s *replicaSelector) canFallback2Follower() bool {
+func (s *replicaSelector) canTryAnotherPeerWithoutBackoff(ctx context.Context) bool {
+	var sessionID uint64
+	if v := ctx.Value(util.SessionID); v != nil {
+		sessionID = v.(uint64)
+	}
+
+	stateStr := "nil"
+	if state, ok := s.state.(*accessFollower); ok {
+		stateStr = fmt.Sprintf("%+v", *state)
+	}
+	logutil.Logger(ctx).Info("canTryAnotherPeerWithoutBackoff", zap.Uint64("connID", sessionID), zap.String("state", stateStr))
+
 	if s == nil || s.state == nil {
 		return false
 	}
@@ -1020,7 +1031,13 @@ func (s *replicaSelector) canFallback2Follower() bool {
 		return false
 	}
 	// can fallback to follower only when the leader is exhausted.
-	return state.lastIdx == state.leaderIdx && state.IsLeaderExhausted(s.replicas[state.leaderIdx])
+	if state.lastIdx == state.leaderIdx && state.IsLeaderExhausted(s.replicas[state.leaderIdx]) {
+		return true
+	}
+	if state.lastIdx != state.leaderIdx {
+		return true
+	}
+	return false
 }
 
 func (s *replicaSelector) invalidateRegion() {
@@ -1815,7 +1832,7 @@ func (s *RegionRequestSender) onRegionError(bo *retry.Backoffer, ctx *RPCContext
 			"tikv reports `ServerIsBusy` retry later",
 			zap.String("reason", regionErr.GetServerIsBusy().GetReason()),
 			zap.Stringer("ctx", ctx))
-		if s.replicaSelector.canFallback2Follower() {
+		if s.replicaSelector.canTryAnotherPeerWithoutBackoff(bo.GetCtx()) {
 			// immediately retry on followers.
 			return true, nil
 		}
