@@ -267,7 +267,7 @@ func (r *regionStore) kvPeer(seed uint32, op *storeSelectorOp) AccessIndex {
 func (r *regionStore) filterStoreCandidate(aidx AccessIndex, op *storeSelectorOp) bool {
 	_, s := r.accessStore(tiKVOnly, aidx)
 	// filter label unmatched store and slow stores when ReplicaReadMode == PreferLeader
-	return s.IsLabelsMatch(op.labels) && (!op.preferLeader || (aidx == r.workTiKVIdx && !s.isSlow()))
+	return s.IsLabelsMatch(op.labels) && (!op.preferLeader || (aidx == r.workTiKVIdx && !s.perfStatus.IsSlow()))
 }
 
 func newRegion(bo *retry.Backoffer, c *RegionCache, pdRegion *pd.Region) (*Region, error) {
@@ -537,7 +537,7 @@ func NewRegionCache(pdClient pd.Client) *RegionCache {
 
 	go c.asyncCheckAndResolveLoop(time.Duration(interval) * time.Second)
 	c.enableForwarding = config.GetGlobalConfig().EnableForwarding
-	// Default use 15s as the update inerval.
+	// Default use 15s as the update interval.
 	go c.asyncUpdateStoreSlowScore(time.Duration(interval/4) * time.Second)
 	if config.GetGlobalConfig().RegionsRefreshInterval > 0 {
 		c.timelyRefreshCache(config.GetGlobalConfig().RegionsRefreshInterval)
@@ -2531,6 +2531,196 @@ func (r *Region) ContainsByEnd(key []byte) bool {
 		(bytes.Compare(key, r.meta.GetEndKey()) <= 0 || len(r.meta.GetEndKey()) == 0)
 }
 
+const (
+	tikvSlowScoreDecayRate     = 20. / 60. // s^(-1), linear decaying
+	tikvSlowScoreSlowThreshold = 80.
+
+	tikvSlowScoreUpdateInterval       = time.Millisecond * 100
+	tikvSlowScoreUpdateFromPDInterval = time.Minute
+	tikvSlowScoreFilterCutFreq        = 1.
+)
+
+type StorePerfStatus struct {
+	isSlow atomic.Bool
+
+	// A statistic for counting the request latency to this store
+	clientSideSlowScore SlowScoreStat
+
+	tikvSideSlowScore *struct {
+		// Assuming the type `Store` is always used in heap instead of in stack
+		sync.Mutex
+
+		// These atomic fields should be read with atomic operations and written with the mutex.
+
+		hasTiKVFeedback atomic.Bool
+		score           atomic.Int64
+		lastUpdateTime  atomic.Pointer[time.Time]
+	}
+}
+
+// IsSlow returns whether current Store is slow or not.
+func (s *StorePerfStatus) IsSlow() bool {
+	return s.isSlow.Load()
+}
+
+// getClientSideSlowScore returns the slow score of store.
+func (s *StorePerfStatus) getClientSideSlowScore() uint64 {
+	return s.clientSideSlowScore.getSlowScore()
+}
+
+// update updates the slow score of this store according to the timecost of current request.
+func (s *StorePerfStatus) update() {
+	s.clientSideSlowScore.updateSlowScore()
+	s.updateTiKVServerSideSlowScoreOnTick()
+}
+
+// recordClientSideSlowScoreStat records timecost of each request.
+func (s *StorePerfStatus) recordClientSideSlowScoreStat(timecost time.Duration) {
+	s.clientSideSlowScore.recordSlowScoreStat(timecost)
+}
+
+// markAlreadySlow marks the related store already slow.
+func (s *StorePerfStatus) markAlreadySlow() {
+	s.clientSideSlowScore.markAlreadySlow()
+}
+
+func (s *StorePerfStatus) updateTiKVServerSideSlowScoreOnTick() {
+	if !s.tikvSideSlowScore.hasTiKVFeedback.Load() {
+		return
+	}
+	now := time.Now()
+	lastUpdateTime := s.tikvSideSlowScore.lastUpdateTime.Load()
+	if lastUpdateTime == nil || now.Sub(*lastUpdateTime) < tikvSlowScoreUpdateFromPDInterval {
+		return
+	}
+
+	if !s.tikvSideSlowScore.TryLock() {
+		// It must be being updated.
+		return
+	}
+	defer s.tikvSideSlowScore.Unlock()
+
+	// Reload update time as it might be updated concurrently before acquiring mutex
+	lastUpdateTime = s.tikvSideSlowScore.lastUpdateTime.Load()
+	elapsed := now.Sub(*lastUpdateTime)
+	if elapsed < tikvSlowScoreUpdateFromPDInterval {
+		return
+	}
+
+	// TODO: Try to get store status from PD.
+
+	// If updating from PD is not successful: decay the slow score.
+	score := s.tikvSideSlowScore.score.Load()
+	if score < 1 {
+		return
+	}
+	// Linear decay by time
+	score = max(int64(math.Round(float64(score)-tikvSlowScoreDecayRate*elapsed.Seconds())), 1)
+	s.tikvSideSlowScore.score.Store(score)
+
+	newUpdateTime := new(time.Time)
+	*newUpdateTime = now
+	s.tikvSideSlowScore.lastUpdateTime.Store(newUpdateTime)
+}
+
+func (s *StorePerfStatus) updateTiKVServerSideSlowScore(score int64, currTime time.Time) {
+	s.tikvSideSlowScore.hasTiKVFeedback.Store(true)
+
+	lastScore := s.tikvSideSlowScore.score.Load()
+
+	// Skip updating to avoid the overhead when it doesn't look slow.
+	if lastScore < 10 && score < 10 {
+		return
+	}
+
+	lastUpdateTime := s.tikvSideSlowScore.lastUpdateTime.Load()
+
+	if lastUpdateTime != nil && currTime.Sub(*lastUpdateTime) < tikvSlowScoreUpdateInterval {
+		return
+	}
+
+	if !s.tikvSideSlowScore.TryLock() {
+		// It must be being updated. Skip.
+		return
+	}
+	defer s.tikvSideSlowScore.Unlock()
+
+	// Reload update time as it might be updated concurrently before acquiring mutex
+	lastUpdateTime = s.tikvSideSlowScore.lastUpdateTime.Load()
+	if lastUpdateTime != nil && currTime.Sub(*lastUpdateTime) < tikvSlowScoreUpdateInterval {
+		return
+	}
+
+	lastScore = s.tikvSideSlowScore.score.Load()
+	newScore := score
+
+	if lastUpdateTime != nil {
+		// It must be positive, otherwise the function exits when checking the update interval.
+		elapsedSecs := currTime.Sub(*lastUpdateTime).Seconds()
+
+		// We do a simple RC low-pass filter at 1Hz to ease possible jitter.
+		const twoPiInvert = 1. / (2 * math.Pi)
+		alpha := elapsedSecs * tikvSlowScoreFilterCutFreq / (elapsedSecs*tikvSlowScoreFilterCutFreq + twoPiInvert)
+		newScore = int64(
+			alpha*float64(score) + (1-alpha)*float64(lastScore),
+		)
+	}
+
+	newUpdateTime := new(time.Time)
+	*newUpdateTime = currTime
+
+	s.tikvSideSlowScore.score.Store(newScore)
+	s.tikvSideSlowScore.lastUpdateTime.Store(newUpdateTime)
+}
+
+func (s *StorePerfStatus) updateSlowFlag() {
+	isSlow := s.clientSideSlowScore.isSlow() || s.tikvSideSlowScore.score.Load() >= tikvSlowScoreSlowThreshold
+	s.isSlow.Store(isSlow)
+}
+
+//func (s *StorePerfStatus) IsSlow(currTime time.Time) bool {
+//	isSlow := s.tikvIsSlow.Load()
+//	if !isSlow {
+//		return false
+//	}
+//
+//	if !s.checkTiKVSideSlowScoreDecay(currTime) {
+//		return true
+//	}
+//	return s.tikvIsSlow.Load()
+//}
+//
+//func (s *StorePerfStatus) checkTiKVSideSlowScoreDecay(currTime time.Time) bool {
+//	lastCheckDecayTime := s.tikvSideSlowScoreInternal.lastCheckDecayTime.Load()
+//	if lastCheckDecayTime == nil || currTime.Sub(*lastCheckDecayTime) < tikvSlowScoreCheckDecayDuration {
+//		return false
+//	}
+//
+//	if !s.tikvSideSlowScoreInternal.TryLock() {
+//		// It's being updated. Skip.
+//		return false
+//	}
+//	defer s.tikvSideSlowScoreInternal.Unlock()
+//
+//	// Recalculate elapsed time as it might be already concurrently updated
+//	lastCheckDecayTime = s.tikvSideSlowScoreInternal.lastCheckDecayTime.Load()
+//	elapsed := currTime.Sub(*lastCheckDecayTime)
+//	if elapsed < tikvSlowScoreCheckDecayDuration {
+//		// Concurrently updated before acquiring mutex. Behave like successfully updated in this case.
+//		return true
+//	}
+//
+//	s.tikvSideSlowScoreInternal.score -= elapsed.Seconds() * tikvSlowScoreDecayRate
+//	if s.tikvSideSlowScoreInternal.score < 0 {
+//		s.tikvSideSlowScoreInternal.score = 0
+//	}
+//
+//	if s.tikvSideSlowScoreInternal.score < tikvSlowScoreSlowThreshold {
+//		s.tikvIsSlow.Store(false)
+//	}
+//	return true
+//}
+
 // Store contains a kv process's address.
 type Store struct {
 	addr         string               // loaded store address
@@ -2552,8 +2742,7 @@ type Store struct {
 	livenessState    uint32
 	unreachableSince time.Time
 
-	// A statistic for counting the request latency to this store
-	slowScore SlowScoreStat
+	perfStatus StorePerfStatus
 	// A statistic for counting the flows of different replicas on this store
 	replicaFlowsStats [numReplicaFlowsType]uint64
 }
@@ -2702,7 +2891,7 @@ func (s *Store) reResolve(c *RegionCache) (bool, error) {
 		newStore := &Store{storeID: s.storeID, addr: addr, peerAddr: store.GetPeerAddress(), saddr: store.GetStatusAddress(), storeType: storeType, labels: store.GetLabels(), state: uint64(resolved)}
 		c.storeMu.Lock()
 		if s.addr == addr {
-			newStore.slowScore = s.slowScore
+			newStore.perfStatus = s.perfStatus
 		}
 		c.storeMu.stores[newStore.storeID] = newStore
 		c.storeMu.Unlock()
@@ -3032,31 +3221,6 @@ func invokeKVStatusAPI(addr string, timeout time.Duration) (l livenessState) {
 	return
 }
 
-// getSlowScore returns the slow score of store.
-func (s *Store) getSlowScore() uint64 {
-	return s.slowScore.getSlowScore()
-}
-
-// isSlow returns whether current Store is slow or not.
-func (s *Store) isSlow() bool {
-	return s.slowScore.isSlow()
-}
-
-// updateSlowScore updates the slow score of this store according to the timecost of current request.
-func (s *Store) updateSlowScoreStat() {
-	s.slowScore.updateSlowScore()
-}
-
-// recordSlowScoreStat records timecost of each request.
-func (s *Store) recordSlowScoreStat(timecost time.Duration) {
-	s.slowScore.recordSlowScoreStat(timecost)
-}
-
-// markAlreadySlow marks the related store already slow.
-func (s *Store) markAlreadySlow() {
-	s.slowScore.markAlreadySlow()
-}
-
 // asyncUpdateStoreSlowScore updates the slow score of each store periodically.
 func (c *RegionCache) asyncUpdateStoreSlowScore(interval time.Duration) {
 	ticker := time.NewTicker(interval)
@@ -3067,17 +3231,17 @@ func (c *RegionCache) asyncUpdateStoreSlowScore(interval time.Duration) {
 			return
 		case <-ticker.C:
 			// update store slowScores
-			c.checkAndUpdateStoreSlowScores()
+			c.checkAndUpdateStorePerfStats()
 		}
 	}
 }
 
-// checkAndUpdateStoreSlowScores checks and updates slowScore on each store.
-func (c *RegionCache) checkAndUpdateStoreSlowScores() {
+// checkAndUpdateStorePerfStats checks and updates performance status on each store.
+func (c *RegionCache) checkAndUpdateStorePerfStats() {
 	defer func() {
 		r := recover()
 		if r != nil {
-			logutil.BgLogger().Error("panic in the checkAndUpdateStoreSlowScores goroutine",
+			logutil.BgLogger().Error("panic in the checkAndUpdateStorePerfStats goroutine",
 				zap.Any("r", r),
 				zap.Stack("stack trace"))
 		}
@@ -3085,8 +3249,8 @@ func (c *RegionCache) checkAndUpdateStoreSlowScores() {
 	slowScoreMetrics := make(map[string]float64)
 	c.storeMu.RLock()
 	for _, store := range c.storeMu.stores {
-		store.updateSlowScoreStat()
-		slowScoreMetrics[store.addr] = float64(store.getSlowScore())
+		store.perfStatus.update()
+		slowScoreMetrics[store.addr] = float64(store.perfStatus.getClientSideSlowScore())
 	}
 	c.storeMu.RUnlock()
 	for store, score := range slowScoreMetrics {
