@@ -1013,6 +1013,21 @@ func (resp *Response) GetExecDetailsV2() *kvrpcpb.ExecDetailsV2 {
 	return details.GetExecDetailsV2()
 }
 
+type getRespFeedback interface {
+	GetResponseFeedback() *kvrpcpb.ResponseFeedbackInformation
+}
+
+func (resp *Response) GetRespFeedback() *kvrpcpb.ResponseFeedbackInformation {
+	if resp == nil || resp.Resp == nil {
+		return nil
+	}
+	feedback, ok := resp.Resp.(getRespFeedback)
+	if !ok {
+		return nil
+	}
+	return feedback.GetResponseFeedback()
+}
+
 // CallRPC launches a rpc call.
 // ch is needed to implement timeout for coprocessor streaming, the stream object's
 // cancel function will be sent to the channel, together with a lease checked by a background goroutine.

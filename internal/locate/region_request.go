@@ -1677,14 +1677,22 @@ func (s *RegionRequestSender) sendReqToRegion(
 	}
 
 	if !injectFailOnSend {
-		start := time.Now()
+		sendReqStartTime := time.Now()
 		resp, err = s.client.SendRequest(ctx, sendToAddr, req, timeout)
+		sendReqFinishTime := time.Now()
 		// Record timecost of external requests on related Store when `ReplicaReadMode == "PreferLeader"`.
 		if rpcCtx.Store != nil && req.ReplicaReadType == kv.ReplicaReadPreferLeader && !util.IsInternalRequest(req.RequestSource) {
-			rpcCtx.Store.perfStatus.recordClientSideSlowScoreStat(time.Since(start))
+			rpcCtx.Store.perfStatus.recordClientSideSlowScoreStat(sendReqFinishTime.Sub(sendReqStartTime))
+		}
+		if err == nil && resp != nil {
+			// TODO: Handle RPC failure cases, which might be caused by TiKV too busy to send the response.
+			feedback := resp.GetRespFeedback()
+			if feedback != nil && feedback.GetPerformanceFeedback() != nil {
+				rpcCtx.Store.perfStatus.updateTiKVServerSideSlowScore(int64(feedback.GetPerformanceFeedback().GetSlowScore()), sendReqFinishTime)
+			}
 		}
 		if s.Stats != nil {
-			RecordRegionRequestRuntimeStats(s.Stats, req.Type, time.Since(start))
+			RecordRegionRequestRuntimeStats(s.Stats, req.Type, sendReqFinishTime.Sub(sendReqStartTime))
 			if val, fpErr := util.EvalFailpoint("tikvStoreRespResult"); fpErr == nil {
 				if val.(bool) {
 					if req.Type == tikvrpc.CmdCop && bo.GetTotalSleep() == 0 {
