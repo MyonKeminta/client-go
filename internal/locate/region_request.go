@@ -2035,10 +2035,11 @@ func (s *RegionRequestSender) sendReqToRegion(
 		}
 	}
 
+	start := time.Now()
+	var rpcDuration time.Duration
 	if !injectFailOnSend {
-		start := time.Now()
 		resp, err = s.client.SendRequest(ctx, sendToAddr, req, timeout)
-		rpcDuration := time.Since(start)
+		rpcDuration = time.Since(start)
 		if s.replicaSelector != nil {
 			recordAttemptedTime(s.replicaSelector, rpcDuration)
 		}
@@ -2113,6 +2114,7 @@ func (s *RegionRequestSender) sendReqToRegion(
 	}
 
 	if err != nil {
+		logutil.Logger(ctx).Error("RPC error", zap.String("addr", sendToAddr), zap.Time("startTime", start), zap.Duration("duration", rpcDuration), zap.Duration("timeout", timeout), zap.Stringer("reqType", req.Type), zap.Stringer("req", req.Req.(fmt.Stringer)), zap.Error(err), zap.Stack("stackTrace"))
 		s.rpcError = err
 		if s.Stats != nil {
 			errStr := errors.Cause(err).Error()
