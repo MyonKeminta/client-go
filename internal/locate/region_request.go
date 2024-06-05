@@ -403,9 +403,6 @@ type accessKnownLeader struct {
 
 func (state *accessKnownLeader) next(bo *retry.Backoffer, selector *replicaSelector) (*RPCContext, error) {
 	leader := selector.replicas[state.leaderIdx]
-
-	evicting := leader.store.evicting.Load()
-
 	liveness := leader.store.getLivenessState()
 	if liveness == unreachable && selector.regionCache.enableForwarding {
 		selector.state = &tryNewProxy{leaderIdx: state.leaderIdx}
