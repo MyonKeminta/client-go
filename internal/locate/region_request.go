@@ -261,6 +261,10 @@ func (r *replica) isEpochStale() bool {
 	return r.epoch != atomic.LoadUint32(&r.store.epoch)
 }
 
+func (r *replica) isEvicting() bool {
+	return r.store.evicting.Load()
+}
+
 func (r *replica) isExhausted(maxAttempt int) bool {
 	return r.attempts >= maxAttempt
 }
@@ -474,7 +478,7 @@ func (state *tryFollower) next(bo *retry.Backoffer, selector *replicaSelector) (
 			}
 			selectReplica := selector.replicas[idx]
 			hasDeadlineExceededErr = hasDeadlineExceededErr || selectReplica.deadlineErrUsingConfTimeout
-			if selectReplica.store.getLivenessState() != unreachable && !selectReplica.deadlineErrUsingConfTimeout &&
+			if selectReplica.store.getLivenessState() != unreachable && !selectReplica.deadlineErrUsingConfTimeout && !selectReplica.isEvicting() &&
 				fn(selectReplica) {
 				return idx, selectReplica
 			}
@@ -805,7 +809,7 @@ func (state *accessFollower) onSendFailure(bo *retry.Backoffer, selector *replic
 
 func (state *accessFollower) isCandidate(idx AccessIndex, replica *replica) bool {
 	// the epoch is staled or retry exhausted, or the store is unreachable.
-	if replica.isEpochStale() || replica.isExhausted(1) || replica.store.getLivenessState() == unreachable || replica.deadlineErrUsingConfTimeout {
+	if replica.isEpochStale() || replica.isExhausted(1) || replica.store.getLivenessState() == unreachable || replica.deadlineErrUsingConfTimeout || replica.isEvicting() {
 		return false
 	}
 	if state.option.leaderOnly {
