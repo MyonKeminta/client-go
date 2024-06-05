@@ -38,10 +38,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
+	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -532,6 +536,7 @@ func NewRegionCache(pdClient pd.Client) *RegionCache {
 	c.enableForwarding = config.GetGlobalConfig().EnableForwarding
 	// Default use 15s as the update inerval.
 	go c.asyncUpdateStoreSlowScore(time.Duration(interval/4) * time.Second)
+	go c.asyncUpdateEvictingStores()
 	if config.GetGlobalConfig().RegionsRefreshInterval > 0 {
 		c.timelyRefreshCache(config.GetGlobalConfig().RegionsRefreshInterval)
 	} else {
@@ -2498,6 +2503,8 @@ type Store struct {
 	slowScore SlowScoreStat
 	// A statistic for counting the flows of different replicas on this store
 	replicaFlowsStats [numReplicaFlowsType]uint64
+
+	evicting atomic.Bool
 }
 
 type resolveState uint64
@@ -3072,6 +3079,125 @@ func (c *RegionCache) checkAndUpdateStoreSlowScores() {
 	for store, score := range slowScoreMetrics {
 		metrics.TiKVStoreSlowScoreGauge.WithLabelValues(store).Set(score)
 	}
+}
+
+type evictLeaderConfigResp struct {
+	StoreIDRanges map[string]interface{} `json:"store-id-ranges"`
+}
+
+func (c *RegionCache) asyncUpdateEvictingStores() {
+	var evictingStores map[uint64]struct{}
+
+	ticker := time.NewTicker(time.Second * 3)
+	defer ticker.Stop()
+
+	withStoreMu := func(f func()) {
+		c.storeMu.Lock()
+		defer c.storeMu.Unlock()
+		f()
+	}
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		newEvictingStores, err := c.fetchEvictingStores()
+		if err != nil {
+			logutil.BgLogger().Warn("failed to fetch evicting stores, skip it", zap.Error(err))
+			continue
+		}
+
+		for storeID := range evictingStores {
+			if _, ok := newEvictingStores[storeID]; !ok {
+				logutil.BgLogger().Info("a store becomes not-evicting state", zap.Uint64("store", storeID))
+				withStoreMu(func() {
+					store, ok := c.storeMu.stores[storeID]
+					if ok {
+						store.evicting.Store(false)
+						atomic.AddUint32(&store.epoch, 1)
+					}
+				})
+			}
+		}
+
+		for storeID := range newEvictingStores {
+			if _, ok := evictingStores[storeID]; !ok {
+				logutil.BgLogger().Info("a store becomes evicting state", zap.Uint64("store", storeID))
+				withStoreMu(func() {
+					store, ok := c.storeMu.stores[storeID]
+					if ok {
+						store.evicting.Store(true)
+						atomic.AddUint32(&store.epoch, 1)
+					}
+				})
+			} else {
+				logutil.BgLogger().Info("a store keeps in evicting state, tick its epoch to invalidate regions on it", zap.Uint64("store", storeID))
+				withStoreMu(func() {
+					store, ok := c.storeMu.stores[storeID]
+					if ok {
+						atomic.AddUint32(&store.epoch, 1)
+					}
+				})
+			}
+		}
+
+		evictingStores = newEvictingStores
+	}
+}
+
+func (c *RegionCache) fetchEvictingStores() (map[uint64]struct{}, error) {
+	pdUrl := c.pdClient.GetLeaderAddr()
+	if len(pdUrl) == 0 {
+		logutil.BgLogger().Info("failed to get PD leader url")
+		return nil, errors.New("failed to get PD leader url")
+	}
+
+	schedulerCfgURL := fmt.Sprintf("%s/%s", pdUrl, "pd/api/v1/scheduler-config/evict-leader-scheduler/list")
+	resp, err := http.Get(schedulerCfgURL)
+	if err != nil {
+		logutil.BgLogger().Error("failed to request scheduler config from pd", zap.Error(err))
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	storeIDsFromResp := func(resp *http.Response) (map[uint64]struct{}, error) {
+		storeIDs := make(map[uint64]struct{})
+		if resp.StatusCode == 404 {
+			return storeIDs, nil
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		var unmarshalledResp evictLeaderConfigResp
+		err = json.Unmarshal(body, &unmarshalledResp)
+		if err != nil {
+			return nil, err
+		}
+
+		result := make(map[uint64]struct{})
+		for key := range unmarshalledResp.StoreIDRanges {
+			storeID, err := strconv.ParseUint(key, 10, 64)
+			if err != nil {
+				return nil, err
+			}
+			result[storeID] = struct{}{}
+		}
+		return result, nil
+	}
+
+	result, err := storeIDsFromResp(resp)
+	if err != nil {
+		logutil.BgLogger().Error("failed to read response body when accessing scheduler config from pd", zap.Error(err))
+		return nil, err
+	}
+
+	return result, nil
 }
 
 // getReplicaFlowsStats returns the statistics on the related replicaFlowsType.
