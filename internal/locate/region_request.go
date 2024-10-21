@@ -1458,6 +1458,7 @@ func (s *RegionRequestSender) SendReqCtx(
 		}
 
 		var retry bool
+		logutil.Logger(bo.GetCtx()).Info("sending request", zap.Stringer("type", req.Type), zap.Stringer("req", req.Req.(fmt.Stringer)), zap.Stringer("ctx", &req.Context), zap.String("storeAddr", rpcCtx.Addr), zap.Uint64("storeID", rpcCtx.Store.StoreID()))
 		resp, retry, err = s.sendReqToRegion(bo, rpcCtx, req, timeout)
 		req.IsRetryRequest = true
 		if err != nil {
