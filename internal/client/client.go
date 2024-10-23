@@ -38,6 +38,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"github.com/pingcap/kvproto/pkg/errorpb"
 	"io"
 	"math"
 	"runtime/trace"
@@ -675,6 +676,16 @@ func (c *RPCClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.R
 	resp, err := c.sendRequest(ctx, addr, req, timeout)
 	if err != nil {
 		return nil, err
+	}
+	if req.Context.StaleRead {
+		regionErr, err := resp.GetRegionError()
+		if err == nil {
+			regionErr.DataIsNotReady = &errorpb.DataIsNotReady{
+				RegionId: req.Context.RegionId,
+				PeerId:   req.Context.Peer.Id,
+				SafeTs:   req.GetStartTS() + 1,
+			}
+		}
 	}
 	return codec.DecodeResponse(req, resp)
 }
