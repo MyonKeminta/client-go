@@ -39,6 +39,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/pingcap/kvproto/pkg/errorpb"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"io"
 	"math"
 	"runtime/trace"
@@ -678,12 +679,26 @@ func (c *RPCClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.R
 		return nil, err
 	}
 	if req.Context.StaleRead {
-		regionErr, err := resp.GetRegionError()
-		if err == nil {
-			regionErr.DataIsNotReady = &errorpb.DataIsNotReady{
-				RegionId: req.Context.RegionId,
-				PeerId:   req.Context.Peer.Id,
-				SafeTs:   req.GetStartTS() + 1,
+		var regionError **errorpb.Error
+		if resp.Resp != nil {
+			switch req.Type {
+			case tikvrpc.CmdCop:
+				regionError = &resp.Resp.(*coprocessor.Response).RegionError
+			case tikvrpc.CmdGet:
+				regionError = &resp.Resp.(*kvrpcpb.GetResponse).RegionError
+			case tikvrpc.CmdScan:
+				regionError = &resp.Resp.(*kvrpcpb.ScanResponse).RegionError
+			case tikvrpc.CmdBatchGet:
+				regionError = &resp.Resp.(*kvrpcpb.BatchGetResponse).RegionError
+			}
+		}
+		if regionError != nil && (*regionError == nil) {
+			*regionError = &errorpb.Error{
+				DataIsNotReady: &errorpb.DataIsNotReady{
+					RegionId: req.Context.RegionId,
+					PeerId:   req.Context.Peer.Id,
+					SafeTs:   req.GetStartTS() + 1,
+				},
 			}
 		}
 	}
