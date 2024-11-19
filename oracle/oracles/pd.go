@@ -502,9 +502,12 @@ func (o *pdOracle) updateTS(ctx context.Context) {
 	for {
 		select {
 		case now := <-ticker.C:
+			// nextUpdateInterval has calculation that depends on the time of the last tick. Calculate next interval
+			// before `doUpdate` as `doUpdate` is responsible for updating the time of the last tick.
+			newInterval := o.nextUpdateInterval(now, 0)
+
 			doUpdate(now)
 
-			newInterval := o.nextUpdateInterval(now, 0)
 			if newInterval != currentInterval {
 				currentInterval = newInterval
 				ticker.Reset(currentInterval)
