@@ -440,16 +440,17 @@ func (o *pdOracle) nextUpdateInterval(now time.Time, requiredStaleness time.Dura
 			}
 
 			o.adaptiveLastTSUpdateInterval.Store(int64(currentAdaptiveUpdateInterval))
-			if o.adaptiveUpdateIntervalState.state != state {
-				logutil.BgLogger().Info("adaptive update ts interval state transition",
-					zap.Duration("configuredInterval", configuredInterval),
-					zap.Duration("prevAdaptiveUpdateInterval", prevAdaptiveUpdateInterval),
-					zap.Duration("newAdaptiveUpdateInterval", currentAdaptiveUpdateInterval),
-					zap.Duration("requiredStaleness", requiredStaleness),
-					zap.Stringer("prevState", o.adaptiveUpdateIntervalState.state),
-					zap.Stringer("newState", state))
-				o.adaptiveUpdateIntervalState.state = state
-			}
+			//if o.adaptiveUpdateIntervalState.state != state {
+			logutil.BgLogger().Info("adaptive update ts interval state transition",
+				zap.Duration("configuredInterval", configuredInterval),
+				zap.Duration("prevAdaptiveUpdateInterval", prevAdaptiveUpdateInterval),
+				zap.Duration("newAdaptiveUpdateInterval", currentAdaptiveUpdateInterval),
+				zap.Duration("requiredStaleness", requiredStaleness),
+				zap.Stringer("prevState", o.adaptiveUpdateIntervalState.state),
+				zap.Time("lastReachDropThresholdTime", lastReachDropThresholdTime),
+				zap.Stringer("newState", state))
+			o.adaptiveUpdateIntervalState.state = state
+			//}
 
 			return currentAdaptiveUpdateInterval
 		}
