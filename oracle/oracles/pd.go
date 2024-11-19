@@ -447,13 +447,22 @@ func (o *pdOracle) nextUpdateInterval(now time.Time, requiredStaleness time.Dura
 				zap.Duration("newAdaptiveUpdateInterval", currentAdaptiveUpdateInterval),
 				zap.Duration("requiredStaleness", requiredStaleness),
 				zap.Stringer("prevState", o.adaptiveUpdateIntervalState.state),
+				zap.Stringer("newState", state),
 				zap.Time("lastReachDropThresholdTime", lastReachDropThresholdTime),
-				zap.Stringer("newState", state))
+				zap.Time("lastTick", o.adaptiveUpdateIntervalState.lastTick))
 			o.adaptiveUpdateIntervalState.state = state
 			//}
 
 			return currentAdaptiveUpdateInterval
 		}
+		logutil.BgLogger().Info("adaptive update ts interval all states mismatch",
+			zap.Duration("configuredInterval", configuredInterval),
+			zap.Duration("prevAdaptiveUpdateInterval", prevAdaptiveUpdateInterval),
+			zap.Duration("newAdaptiveUpdateInterval", currentAdaptiveUpdateInterval),
+			zap.Duration("requiredStaleness", requiredStaleness),
+			zap.Stringer("prevState", o.adaptiveUpdateIntervalState.state),
+			zap.Time("lastReachDropThresholdTime", lastReachDropThresholdTime),
+			zap.Time("lastTick", o.adaptiveUpdateIntervalState.lastTick))
 		return currentAdaptiveUpdateInterval
 	}
 
@@ -572,7 +581,8 @@ func (o *pdOracle) SetLowResolutionTimestampUpdateInterval(newUpdateInterval tim
 		zap.Duration("previous", time.Duration(prevConfigured)),
 		zap.Duration("new", newUpdateInterval),
 		zap.Duration("prevAdaptiveUpdateInterval", time.Duration(adaptiveUpdateInterval)),
-		zap.Bool("adaptiveUpdateIntervalUpdated", adaptiveUpdateIntervalUpdated))
+		zap.Bool("adaptiveUpdateIntervalUpdated", adaptiveUpdateIntervalUpdated),
+		zap.Stack("stack"))
 
 	return nil
 }
