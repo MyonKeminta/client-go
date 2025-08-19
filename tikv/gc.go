@@ -258,6 +258,8 @@ func scanLocksInOneRegionWithStartKey(bo *retry.Backoffer, store Storage, startK
 			Limit:      limit,
 			StartKey:   startKey,
 			EndKey:     loc.EndKey,
+		}, kvrpcpb.Context{
+			NotFillCache: true,
 		})
 		resp, err := store.SendReq(bo, req, loc.Region, ReadTimeoutMedium)
 		if err != nil {
