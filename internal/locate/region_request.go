@@ -472,7 +472,7 @@ func (s *RegionRequestSender) SendReqAsync(
 	cb async.Callback[*tikvrpc.ResponseExt],
 	opts ...StoreSelectorOption,
 ) {
-	if resp, err := failpointSendReqResult(req, tikvrpc.TiKV); err != nil || resp != nil {
+	if resp, err := failpointSendReqResult(bo.GetCtx(), req, tikvrpc.TiKV); err != nil || resp != nil {
 		var re *tikvrpc.ResponseExt
 		if resp != nil {
 			re = &tikvrpc.ResponseExt{Response: *resp}
@@ -1495,7 +1495,7 @@ func (s *RegionRequestSender) SendReqCtx(
 		bo.SetCtx(opentracing.ContextWithSpan(bo.GetCtx(), span1))
 	}
 
-	if resp, err = failpointSendReqResult(req, et); err != nil || resp != nil {
+	if resp, err = failpointSendReqResult(bo.GetCtx(), req, et); err != nil || resp != nil {
 		return
 	}
 
@@ -2364,10 +2364,15 @@ func (s *baseReplicaSelector) backoffOnNoCandidate(bo *retry.Backoffer) error {
 }
 
 // failpointSendReqResult is used to process the failpoint For tikvStoreSendReqResult.
-func failpointSendReqResult(req *tikvrpc.Request, et tikvrpc.EndpointType) (
+func failpointSendReqResult(ctx context.Context, req *tikvrpc.Request, et tikvrpc.EndpointType) (
 	resp *tikvrpc.Response,
 	err error,
 ) {
+	var sessionID uint64
+	if v := ctx.Value(util.SessionID); v != nil {
+		sessionID = v.(uint64)
+	}
+
 	if val, e := util.EvalFailpoint("tikvStoreSendReqResult"); e == nil {
 		failpointCfg, ok := val.(string)
 		if !ok {
@@ -2417,5 +2422,25 @@ func failpointSendReqResult(req *tikvrpc.Request, et tikvrpc.EndpointType) (
 			}
 		}
 	}
+
+	if sessionID != 0 && req.Type == tikvrpc.CmdCop {
+		if val, e := util.EvalFailpoint("tikvStoreCopReqResult"); e == nil {
+			failpointCfg, ok := val.(string)
+			if !ok {
+				return
+			}
+			switch failpointCfg {
+			case "bucketVersionNotMatch":
+				logutil.BgLogger().Info("failpoint `tikvStoreCopReqResult` at `bucketVersionNotMatch` is effective")
+				resp = &tikvrpc.Response{
+					Resp: &coprocessor.Response{
+						RegionError: &errorpb.Error{EpochNotMatch: &errorpb.EpochNotMatch{}},
+					},
+				}
+				return
+			}
+		}
+	}
+
 	return
 }
