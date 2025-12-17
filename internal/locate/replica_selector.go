@@ -488,6 +488,7 @@ func (s *replicaSelector) onNotLeader(
 	if leader == nil {
 		// The region may be during transferring leader.
 		err = bo.Backoff(retry.BoRegionScheduling, errors.Errorf("no leader, ctx: %v", ctx))
+		s.regionCache.InvalidateCachedRegionWithReason(ctx.Region, NoLeader)
 		return err == nil, err
 	}
 	leaderIdx := s.updateLeader(leader)
